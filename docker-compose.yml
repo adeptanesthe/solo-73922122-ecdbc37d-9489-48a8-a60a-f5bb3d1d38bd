@@ -1,0 +1,17 @@
+services:
+  lis:
+    build: .
+    container_name: lis-analyser-receiver
+    ports:
+      - "8000:8000"   # HTTP API + /docs
+      - "2575:2575"   # MLLP TCP for the analyser
+    environment:
+      LIS_DB_PATH: /data/lis.db
+      LIS_MLLP_HOST: 0.0.0.0
+      LIS_MLLP_PORT: "2575"
+    volumes:
+      - lis-data:/data
+    restart: unless-stopped
+
+volumes:
+  lis-data:
