@@ -9,6 +9,11 @@ services:
       LIS_DB_PATH: /data/lis.db
       LIS_MLLP_HOST: 0.0.0.0
       LIS_MLLP_PORT: "2575"
+      # Default per-row pause (ms) of a background mapping recompute.  The
+      # sleep happens outside every database lock, so MLLP ingestion is never
+      # blocked.  Each PUT /api/v1/standard/mapping may override with
+      # delay_ms; 0 is the production-safe default.
+      LIS_RECALC_DELAY_MS: "0"
     volumes:
       - lis-data:/data
     restart: unless-stopped

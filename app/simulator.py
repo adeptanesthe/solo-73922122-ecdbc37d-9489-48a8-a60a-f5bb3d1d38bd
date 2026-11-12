@@ -12,10 +12,17 @@ Scenarios (each goes through the real TCP socket, not the store directly):
 5. ``corrected``    — OBX-11=C correction of an existing item.
 6. ``rejected``     — an illegal message; whole message rejected with AE and
                       no partial result is stored.
+7. ``standardised`` — mapping replacement with a visible background recompute
+                      (tunable delay), an F and a correction C submitted while
+                      the recompute is running, unavailable items
+                      (no_mapping / unit_mismatch) and exact decimal output.
+                      Uses the HTTP API on the same service (default port 8000).
 
 Usage:
     python -m app.simulator --host 127.0.0.1 --port 2575
     python -m app.simulator --host 127.0.0.1 --port 2575 --scenario concurrent
+    python -m app.simulator --host 127.0.0.1 --port 2575 \
+        --scenario standardised --http-url http://127.0.0.1:8000 --delay-ms 40
     docker compose exec lis python -m app.simulator --host 127.0.0.1 --port 2575
 """
 
@@ -23,8 +30,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 
 log = logging.getLogger("simulator")
@@ -190,6 +200,106 @@ async def scenario_rejected(host: str, port: int) -> None:
     show("mixed valid+invalid OBX", await send_frame(host, port, frame(text)))
 
 
+# --------------------------------------------------------------------------- #
+# Standardisation demo (HTTP API + MLLP traffic during a background recompute)
+# --------------------------------------------------------------------------- #
+
+def _http_json(method: str, url: str, payload: dict | None = None) -> tuple[int, dict]:
+    data = None if payload is None else json.dumps(payload).encode("ascii")
+    req = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status, json.loads(resp.read().decode("ascii"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("ascii"))
+
+
+async def scenario_standardised(host: str, port: int, http_url: str,
+                                delay_ms: int) -> None:
+    print(f"[standardised] mapping replacement with {delay_ms} ms/row recompute "
+          "delay; corrections arrive while it runs")
+    sample = "S-900"
+    # F results: GLU and CREA are mappable; K has no mapping yet.
+    show("initial F", await send_frame(host, port, frame(message(
+        "STD-F1", sample, [("GLU", "7.10", "mmol/L"),
+                           ("CREA", "92", "umol/L"),
+                           ("K", "4.10", "mmol/L")]))))
+    status, data = _http_json("GET", f"{http_url}/api/v1/standard/samples/{sample}")
+    print("  before mapping: " + ", ".join(
+        f"{i['code']}=unavailable({i['reason']})" for i in data["items"]))
+
+    mapping = [
+        {"source_item": "GLU", "source_unit": "mmol/L",
+         "standard_item": "GLUCOSE", "standard_unit": "mmol/L",
+         "coefficient": "1"},
+        {"source_item": "CREA", "source_unit": "umol/L",
+         "standard_item": "CREATININE", "standard_unit": "mg/dL",
+         # exact decimal: 92 umol/L * 0.0113 = 1.0396 mg/dL
+         "coefficient": "0.0113"},
+    ]
+    status, started = _http_json(
+        "PUT", f"{http_url}/api/v1/standard/mapping",
+        {"entries": mapping, "note": "simulator demo",
+         "delay_ms": delay_ms})
+    assert status == 202, started
+    task_id = started["task_id"]
+    print(f"  replacement accepted: task={task_id} version="
+          f"{started['version_id']} (202, recompute in background)")
+
+    # A second replacement while the first runs must be refused (409).
+    status, conflict = _http_json(
+        "PUT", f"{http_url}/api/v1/standard/mapping",
+        {"entries": [{"source_item": "K", "source_unit": "mmol/L",
+                      "standard_item": "POTASSIUM", "standard_unit": "mmol/L",
+                      "coefficient": "1"}], "delay_ms": delay_ms})
+    print(f"  concurrent replacement -> HTTP {status}: {conflict.get('detail')}")
+
+    # MLLP keeps accepting F/C during the recompute window.
+    show("correction C during recompute", await send_frame(
+        host, port, frame(message("STD-C1", sample,
+                                  [("GLU", "5.80", "mmol/L")], method="C"))))
+    show("new sample F during recompute", await send_frame(
+        host, port, frame(message("STD-F2", "S-901",
+                                  [("CREA", "88.4956", "umol/L"),
+                                   ("ALT", "33", "U/L")]))))
+
+    # Poll task status until the atomic switch.
+    for _ in range(500):
+        status, task = _http_json(
+            "GET", f"{http_url}/api/v1/standard/tasks/{task_id}")
+        if task["state"] in ("completed", "failed", "interrupted"):
+            break
+        await asyncio.sleep(0.05)
+    print(f"  task {task_id}: {task['state']} "
+          f"({task['processed_rows']}/{task['total_rows']} rows)")
+    assert task["state"] == "completed", task
+
+    status, data = _http_json(
+        "GET", f"{http_url}/api/v1/standard/samples/{sample}")
+    for item in data["items"]:
+        if item["available"]:
+            print(f"  {item['code']:>5} {item['source_value']} {item['source_unit']} "
+                  f"-> {item['standard_item']} = {item['standard_value']} "
+                  f"{item['standard_unit']} (x{item['coefficient']})")
+        else:
+            print(f"  {item['code']:>5} unavailable: {item['reason']}")
+    by_code = {i["code"]: i for i in data["items"]}
+    assert by_code["GLU"]["source_value"] == "5.80", "correction must survive"
+    assert by_code["GLU"]["control_id"] == "STD-C1"
+    assert by_code["CREA"]["standard_value"] == "1.0396"
+    assert by_code["K"]["reason"] == "no_mapping"
+
+    status, data = _http_json("GET",
+                              f"{http_url}/api/v1/standard/samples/S-901")
+    by_code = {i["code"]: i for i in data["items"]}
+    print(f"  S-901 CREA -> {by_code['CREA']['standard_value']} mg/dL; "
+          f"ALT unavailable({by_code['ALT']['reason']})")
+    print("  -> new mapping and all its results switched atomically; raw "
+          "results, messages and ACKs are unchanged")
+
+
 SCENARIOS = {
     "fragmented": scenario_fragmented,
     "burst": scenario_burst,
@@ -204,8 +314,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=2575)
-    parser.add_argument("--scenario", choices=sorted(SCENARIOS),
-                        action="append", help="default: all scenarios")
+    parser.add_argument("--scenario", choices=sorted(
+        list(SCENARIOS) + ["standardised"]),
+        action="append", help="default: all MLLP scenarios")
+    parser.add_argument("--http-url", default="http://127.0.0.1:8000",
+                        help="HTTP API base URL for the standardised scenario")
+    parser.add_argument("--delay-ms", type=int, default=40,
+                        help="per-row recompute delay used by the standardised "
+                             "scenario (kept outside every DB lock)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -213,10 +329,17 @@ def main() -> int:
     chosen = args.scenario or list(SCENARIOS)
     try:
         for name in chosen:
-            asyncio.run(SCENARIOS[name](args.host, args.port))
+            if name == "standardised":
+                asyncio.run(scenario_standardised(
+                    args.host, args.port, args.http_url, args.delay_ms))
+            else:
+                asyncio.run(SCENARIOS[name](args.host, args.port))
     except ConnectionRefusedError:
         print(f"cannot connect to {args.host}:{args.port}; is the receiver running?",
               file=sys.stderr)
+        return 1
+    except urllib.error.URLError as exc:
+        print(f"cannot reach HTTP API at {args.http_url}: {exc}", file=sys.stderr)
         return 1
     return 0
 
